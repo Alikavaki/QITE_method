@@ -131,9 +131,3 @@ psi_list, coefficients_list = iterative_solver(H, basis_matrices, psi, tau=0.1, 
 
 Contributions are welcome! Feel free to submit issues or pull requests to improve the implementation.
 
----
-
-This documentation provides a structured guide for using the QITE implementation effectively. Let me know if you need revisions! 🚀
-
-Sounds good, how can I upload it to my github account, should I put it in the readme file?
-
