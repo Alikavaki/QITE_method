@@ -1,56 +1,55 @@
-from scipy.sparse import csc_matrix, eye, kron, isspmatrix
+from scipy.sparse import lil_matrix, csc_matrix, eye, kron, isspmatrix
 from scipy.sparse.linalg import expm_multiply, lsqr
 from scipy.linalg import pinv
 import numpy as np
 cimport numpy as cnp
+from time import time  # Import the time module for runtime tracking
+
 #################################################################
-
-# Efficient sparse tensor product computation
+# Efficient sparse tensor product computation (now uses LIL during construction)
 cpdef object generate_sparse_tensor_product_iterative(list operators):
-    cdef object result = eye(1, format="csc", dtype=np.complex128)  # Updated to np.complex128
+    cdef object result = eye(1, format="lil", dtype=np.complex128)  # Start with LIL
     for op in operators:
-        result = kron(result, op, format="csc")  # Sparse Kronecker product
-    return result
+        result = kron(result, op, format="lil")  # Build with LIL
+    return result.tocsc()  # Convert to CSC for storage/operations
 
-
-# Get sparse Pauli matrices
+# Get sparse Pauli matrices (now LIL-based)
 def get_sparse_pauli_matrices():
-    cdef object I = eye(2, format="csc", dtype=np.complex128)  # Updated to np.complex128
-    cdef object X = csc_matrix([[0, 1], [1, 0]], dtype=np.complex128)
-    cdef object Y = csc_matrix([[0, -1j], [1j, 0]], dtype=np.complex128)
-    cdef object Z = csc_matrix([[1, 0], [0, -1]], dtype=np.complex128)
-    return I, X, Y, Z
+    cdef object I = eye(2, format="lil", dtype=np.complex128)
+    cdef object X = lil_matrix([[0, 1], [1, 0]], dtype=np.complex128)
+    cdef object Y = lil_matrix([[0, -1j], [1j, 0]], dtype=np.complex128)
+    cdef object Z = lil_matrix([[1, 0], [0, -1]], dtype=np.complex128)
+    return I, X, Y, Z  # Return LIL matrices for construction
 
-
-# Create sparse operators
+# Create sparse operators (now uses LIL during initialization)
 cpdef list create_sparse_operators(
     int n_qubits,
     int i,
-    object target,  # Allow `None`
+    object target,
     object operator1,
     object operator2
 ):
-    cdef list ops = [eye(2, format="csc", dtype=np.complex128)] * n_qubits  # Updated to np.complex128
-    ops[i] = operator1
+    # Initialize with LIL matrices
+    cdef list ops = [eye(2, format="lil", dtype=np.complex128)] * n_qubits
+    ops[i] = operator1.tolil() if isspmatrix(operator1) else operator1
     if target is not None:
-        ops[int(target) % n_qubits] = operator2
+        ops[int(target) % n_qubits] = operator2.tolil() if isspmatrix(operator2) else operator2
     return ops
 
-
-# Generate sparse basis
+# Generate sparse basis (unchanged except for underlying matrix format)
 cpdef list basis(int n_qubits):
-    cdef list matrices = []  # Final list of sparse matrices
+    cdef list matrices = []
     cdef int i, offset
     cdef object matrix
     I, X, Y, Z = get_sparse_pauli_matrices()
 
-    # Part 1: Single-qubit Y gates
+    # Single-qubit Y gates
     for i in range(n_qubits):
-        ops = create_sparse_operators(n_qubits, i, None, Y, None)  # Y on qubit i
+        ops = create_sparse_operators(n_qubits, i, None, Y, None)
         matrix = generate_sparse_tensor_product_iterative(ops)
         matrices.append(matrix)
 
-    # Part 2: Pairs of operators
+    # Pairs of operators
     for i in range(n_qubits):
         for offset in range(1, (n_qubits // 2) + 1):
             if offset < n_qubits // 2:
@@ -72,191 +71,85 @@ cpdef list basis(int n_qubits):
                 matrices.append(matrix)
 
     return matrices
+
 ################################################################################
-
-
-cpdef list b_matrix(
-    object hamiltonian,  # Sparse Hamiltonian
-    list matrices,       # List of sparse matrices
-    object psi           # Sparse |psi| (csc_matrix)
-):
-    """
-    Compute the b vector using the commutator [H, A] for each matrix A in matrices.
-
-    Parameters:
-        hamiltonian (csc_matrix): The Hamiltonian matrix (sparse format).
-        matrices (list of csc_matrix): List of sparse tensor product matrices.
-        psi (csc_matrix): The state vector |psi| (sparse column matrix).
-
-    Returns:
-        list: The b vector as a list of complex numbers.
-    """
+# Remaining functions unchanged except type annotations
+cpdef list b_matrix(object hamiltonian, list matrices, object psi):
     cdef list b = []
-    cdef object commutator  # Sparse commutator
-    cdef object result      # Result of dot product
+    cdef object commutator
+    cdef object result
     cdef cnp.complex128_t expectation_value
 
     for matrix in matrices:
-        # Compute the commutator [H, A] = H @ A - A @ H
         commutator = hamiltonian @ matrix - matrix @ hamiltonian
-
-        # Compute the expectation value: psi.H @ commutator @ psi
-        result = psi.getH() @ commutator @ psi  # Sparse matrix multiplications
-        if result.nnz > 0:  # If the result is non-empty
-            expectation_value = result.data[0]  # Extract the first value
-        else:
-            expectation_value = 0
-
-        b.append(-1j * expectation_value)
-
+        result = psi.getH() @ commutator @ psi
+        b.append(-1j * (result.data[0] if result.nnz > 0 else 0))
     return b
-
-#####################################################################################
-
-
+##############################################################################################
 cpdef object compute_s_matrices(list matrices, object psi):
-    """
-    Compute the S matrix for the system.
-
-    Parameters:
-        matrices (list of csc_matrix): List of sparse tensor product matrices.
-        psi (csc_matrix): The state vector |psi| as a sparse column matrix.
-
-    Returns:
-        csc_matrix: The S matrix as a sparse matrix.
-    """
-    from scipy.sparse import csc_matrix
+    from scipy.sparse import lil_matrix
     cdef int n_matrices = len(matrices)
-    cdef object s_matrices = csc_matrix((n_matrices, n_matrices), dtype=np.complex128)
+    cdef object s_matrices = lil_matrix((n_matrices, n_matrices), dtype=np.complex128)
     cdef object matrix_i, matrix_j, intermediate
     cdef int i, j
     cdef cnp.complex128_t value
 
     for i in range(n_matrices):
         for j in range(n_matrices):
-            # Compute <psi| matrix_i† matrix_j |psi>
-            matrix_i = matrices[i].getH()  # Hermitian conjugate of matrix_i
+            matrix_i = matrices[i].getH()
             matrix_j = matrices[j]
-            intermediate = matrix_i @ matrix_j @ psi  # Sparse multiplication
-            
-            # Check if intermediate is non-empty
-            if intermediate.nnz > 0:
-                result = psi.getH() @ intermediate  # psi† @ intermediate
-                if result.nnz > 0:
-                    value = result.data[0]  # Extract the scalar
-                else:
-                    value = 0
-            else:
-                value = 0
+            intermediate = matrix_i @ matrix_j @ psi
+            result = psi.getH() @ intermediate
+            value = result.data[0] if intermediate.nnz > 0 and result.nnz > 0 else 0
+            s_matrices[i, j] = value
 
-            s_matrices[i, j] = value  # Populate the S-matrix
-
-    # Ensure S-matrix is symmetric
-    return s_matrices + s_matrices.getH()
-
-
-
-######################################################################################
-
-
-from time import time  # Import the time module for runtime tracking
-
-cpdef tuple iterative_solver(
-    object hamiltonian,
-    list matrices,
-    object psi,  # Sparse |psi| (csc_matrix)
-    double tau,
-    int num_iterations,
-    double a,
-    double r
-):
-    """
-    Perform an iterative update on the state vector |psi> and return results.
-
-    Parameters:
-        hamiltonian (csc_matrix): Sparse Hamiltonian matrix.
-        matrices (list): List of sparse matrices for the iterative process.
-        psi (csc_matrix): Initial state vector (sparse column matrix).
-        tau (float): Time step for the exponential operator.
-        num_iterations (int): Number of iterations to perform.
-        my_rcond (float): Cutoff for pseudoinverse computation.
-
-    Returns:
-        tuple: (psi_list, coefficients_list)
-    """
+    return (s_matrices + s_matrices.getH()).tocsc()  # Return CSC for symmetry
+###################################################################################################
+cpdef tuple iterative_solver(object hamiltonian, list matrices, object psi, 
+                            double tau, int num_iterations, double a, double r):
     cdef list psi_list = [psi]
     cdef list coefficients_list = []
     cdef object s_matrix, b_vector, operator
     cdef cnp.ndarray[cnp.complex128_t, ndim=1] coefficients
-    cdef int i, iteration
-
-    
 
     for iteration in range(num_iterations):
-        # Start tracking the runtime
+        #Start tracking the runtime
         start_time = time()
-        # Step 1: Compute S-matrix
         s_matrix = compute_s_matrices(matrices, psi)
-
-        # Step 2: Compute b-matrix
         b_vector = b_matrix(hamiltonian, matrices, psi)
         b_array = np.array(b_vector, dtype=np.complex128).reshape(-1, 1)
 
-        # Step 3: Compute pseudoinverse of S-matrix and coefficients
         if isinstance(s_matrix, csc_matrix):
             coefficients = -lsqr(s_matrix, b_array)[0]
         else:
-            s_dense = s_matrix.toarray()
-            s_pinv = pinv(s_dense, atol=a, rtol=r).astype(np.complex128)
+            s_pinv = pinv(s_matrix.toarray(), atol=a, rtol=r).astype(np.complex128)
             coefficients = -s_pinv @ b_array
 
-        coefficients = coefficients.flatten()
-        coefficients_list.append(coefficients.tolist())
-
-        # Step 4: Construct operator from coefficients
+        coefficients_list.append(coefficients.flatten().tolist())
         operator = construct_operator(matrices, coefficients)
-
-        # Step 5: Update psi using the matrix exponential
         psi = expm_multiply(-1j * tau * operator, psi)
         psi_list.append(psi)
-
-        # Log iteration completion
-        print(f"Iteration {iteration + 1}/{num_iterations} completed.", flush=True)
-        # End tracking runtime
         end_time = time()
         runtime = end_time - start_time
+        #Log iteration completion
+        print(f"Iteration {iteration + 1}/{num_iterations} completed.", flush=True)
         # Print runtime
         print(f"Iterative solver completed in {runtime:.2f} seconds.", flush=True)
-    
 
     return psi_list, coefficients_list
-
-
-######################################################################################################
-
-
+#####################################################################################################
 cpdef object construct_operator(list matrices, cnp.ndarray[cnp.complex128_t, ndim=1] coefficients):
     """
     Construct the operator from the given matrices and coefficients.
-
-    Parameters:
-        matrices (list): List of sparse matrices (csc_matrix).
-        coefficients (cnp.ndarray[cnp.complex128_t, ndim=1]): Array of coefficients.
-
-    Returns:
-        object: Sparse operator (csc_matrix).
     """
-    cdef object operator  # Declare as a general Python object
+    # Changed variable name from 'operator' to 'op' to avoid C++ keyword conflict
+    cdef object op = csc_matrix(matrices[0].shape, dtype=np.complex128)
     cdef int i
-
-    # Initialize the operator as a zero sparse matrix with the same shape as the first matrix
-    operator = csc_matrix(matrices[0].shape, dtype=np.complex128)
-
-    # Sum the coefficients * matrices
+    
     for i in range(len(matrices)):
-        operator += coefficients[i] * matrices[i]
-
-    return operator
+        op += coefficients[i] * matrices[i]
+    
+    return op
 
 
 
